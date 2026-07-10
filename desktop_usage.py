@@ -83,19 +83,19 @@ def push_supabase(row):
     url, key = env.get("SUPABASE_URL"), env.get("SUPABASE_KEY")
     table = env.get("SUPABASE_TABLE", "claude_usage")
     if not url or not key:
-        print("supabase: no credentials (.env missing SUPABASE_URL/KEY) — skipped")
+        print("supabase: no credentials (.env missing SUPABASE_URL/KEY) - skipped")
         return False
     try:
         from supabase import create_client
     except ImportError:
-        print("supabase: package not installed — run `pip install supabase`")
+        print("supabase: package not installed - run `pip install supabase`")
         return False
     try:
         create_client(url, key).table(table).insert(row).execute()
         print(f"supabase: pushed to '{table}'")
         return True
     except Exception as e:
-        print(f"supabase: push failed — {e}")
+        print(f"supabase: push failed - {e}")
         return False
 
 
@@ -227,7 +227,7 @@ def _snapshot_db(src, tmp):
     if not _is_admin():
         raise SystemExit(
             "Claude Desktop has the cookie DB locked, so reading it needs a "
-            "Volume Shadow Copy — which requires admin.\n"
+            "Volume Shadow Copy - which requires admin.\n"
             "Run this from an ELEVATED PowerShell (Run as administrator), or "
             "let the scheduled task (created with --install-task) run it "
             "elevated for you."
@@ -383,29 +383,49 @@ TASK_NAME = "ClaudeUsageDaily"
 
 
 def install_task(time_str):
-    """Create a daily, elevated scheduled task that logs usage via VSS."""
+    """Create a daily, elevated scheduled task that logs usage via VSS.
+    Uses PowerShell's ScheduledTasks module so we can set StartWhenAvailable
+    (catch up a missed run after the PC was off) and WakeToRun (wake from
+    sleep) -- neither of which schtasks.exe can configure."""
     if not _is_admin():
         raise SystemExit("Run --install-task from an ELEVATED PowerShell (admin).")
     if getattr(sys, "frozen", False):
-        # Packaged exe: the exe itself is the task action.
-        tr = f'"{sys.executable}" --log'
+        execute = sys.executable
+        argument = "--log"
     else:
         py = sys.executable
-        # Prefer pythonw.exe so no console window pops up on the schedule.
         pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
         exe = pyw if os.path.exists(pyw) else py
-        script = os.path.abspath(__file__)
-        tr = f'"{exe}" "{script}" --log'
+        execute = exe
+        argument = f'"{os.path.abspath(__file__)}" --log'
+
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
+        f"$a=New-ScheduledTaskAction -Execute '{execute}' -Argument '{argument}';"
+        f"$t=New-ScheduledTaskTrigger -Daily -At '{time_str}';"
+        # StartWhenAvailable = run ASAP if the scheduled time was missed
+        # (machine off/hibernated). WakeToRun = wake from sleep to run.
+        "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun "
+        "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+        "-ExecutionTimeLimit (New-TimeSpan -Hours 1);"
+        "$p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive "
+        "-RunLevel Highest;"
+        f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t "
+        "-Settings $s -Principal $p -Force | Out-Null;"
+        "Write-Output 'ok'"
+    )
     proc = subprocess.run(
-        ["schtasks", "/create", "/tn", TASK_NAME, "/tr", tr,
-         "/sc", "daily", "/st", time_str, "/rl", "highest", "/f"],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
         capture_output=True, text=True,
     )
-    print(proc.stdout.strip() or proc.stderr.strip())
-    if proc.returncode == 0:
-        print(f"Installed '{TASK_NAME}' -> runs daily at {time_str}, logs to {CSV_FILE}")
-    else:
-        raise SystemExit(f"schtasks failed (exit {proc.returncode}).")
+    if proc.returncode != 0 or "ok" not in (proc.stdout or ""):
+        raise SystemExit(
+            "task registration failed:\n"
+            + (proc.stdout or "") + (proc.stderr or "")
+        )
+    print(f"Installed '{TASK_NAME}' -> daily at {time_str}. If the PC is off or "
+          f"asleep then, it runs at the next wake/login. Logs to {CSV_FILE}")
 
 
 def uninstall_task():
@@ -433,7 +453,7 @@ def main():
     seven = (data.get("seven_day") or {}).get("utilization")
     resets = (data.get("five_hour") or {}).get("resets_at")
     now = datetime.datetime.now()
-    print(f"[{now:%Y-%m-%d %H:%M}] {email or 'unknown'}  org {org[:8]}…  "
+    print(f"[{now:%Y-%m-%d %H:%M}] {email or 'unknown'}  org {org[:8]}..  "
           f"5h: {five}%  7d: {seven}%"
           + (f"  (5h resets {resets})" if resets else ""))
 

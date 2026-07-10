@@ -76,4 +76,5 @@ in the SQL editor.
 
 - Windows + Claude **Desktop** only. Not for Claude Code or the web app.
 - App‑bound `v20` cookie encryption is not supported (falls back with a message).
-- If the PC is asleep at the scheduled time, that day's run is skipped.
+- **Missed runs are caught up:** if the PC is off or asleep at the scheduled
+  time, the task runs at the next wake/login (and it wakes the PC from sleep).

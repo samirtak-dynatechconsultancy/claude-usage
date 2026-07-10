@@ -56,5 +56,6 @@ Remove later with: `.\ClaudeUsage.exe --uninstall-task`
   it INSERT only; it cannot read others' rows.
 - Undocumented `/usage` endpoint; if Anthropic changes fields the script prints
   an error and pushes nulls — check `five_hour.utilization` mapping if so.
-- If the machine is asleep at the scheduled time the run is missed; add
-  `/RU` catch-up handling if you need guaranteed capture.
+- Missed runs are caught up automatically: the task is registered with
+  `StartWhenAvailable` + `WakeToRun`, so an off/asleep machine runs the job at
+  the next wake or login instead of skipping the day.
