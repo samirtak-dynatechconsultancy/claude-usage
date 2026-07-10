@@ -1,0 +1,15 @@
+# secrets (bundled into the GitHub Release zip instead, not committed)
+.env
+
+# local data
+usage.csv
+
+# python / pyinstaller build artifacts
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+release/
+*.zip
+build_log.txt
