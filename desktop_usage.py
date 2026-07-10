@@ -382,35 +382,52 @@ def resolve_and_fetch(cookie):
 TASK_NAME = "ClaudeUsageDaily"
 
 
-def install_task(time_str):
-    """Create a daily, elevated scheduled task that logs usage via VSS.
-    Uses PowerShell's ScheduledTasks module so we can set StartWhenAvailable
-    (catch up a missed run after the PC was off) and WakeToRun (wake from
-    sleep) -- neither of which schtasks.exe can configure."""
-    if not _is_admin():
-        raise SystemExit("Run --install-task from an ELEVATED PowerShell (admin).")
+def _task_action_parts():
+    """(execute, argument) for the scheduled-task action."""
     if getattr(sys, "frozen", False):
-        execute = sys.executable
-        argument = "--log"
+        return sys.executable, "--log"
+    py = sys.executable
+    pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+    exe = pyw if os.path.exists(pyw) else py
+    return exe, f'"{os.path.abspath(__file__)}" --log'
+
+
+def install_task(time_str, all_users=False):
+    """Create a daily, elevated scheduled task that logs usage via VSS.
+
+    all_users=False -> task runs as the current user (interactive per-user install).
+    all_users=True  -> task runs as whichever member of BUILTIN\\Users is logged
+                       on (for Intune/SYSTEM-context deploys), and also fires at
+                       logon. Requires that logged-on user to be a local admin,
+                       since VSS needs elevation.
+
+    Uses PowerShell's ScheduledTasks module for StartWhenAvailable (catch up a
+    missed run after the PC was off) + WakeToRun, which schtasks.exe can't set.
+    """
+    if not _is_admin():
+        raise SystemExit("Run install elevated (admin) or in SYSTEM context.")
+    execute, argument = _task_action_parts()
+
+    if all_users:
+        principal = ("$p=New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' "
+                     "-RunLevel Highest;")
+        trigger = (f"$t=@((New-ScheduledTaskTrigger -Daily -At '{time_str}'),"
+                   "(New-ScheduledTaskTrigger -AtLogOn));")
     else:
-        py = sys.executable
-        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
-        exe = pyw if os.path.exists(pyw) else py
-        execute = exe
-        argument = f'"{os.path.abspath(__file__)}" --log'
+        principal = (
+            "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
+            "$p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive "
+            "-RunLevel Highest;")
+        trigger = f"$t=New-ScheduledTaskTrigger -Daily -At '{time_str}';"
 
     ps = (
         "$ErrorActionPreference='Stop';"
-        "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
         f"$a=New-ScheduledTaskAction -Execute '{execute}' -Argument '{argument}';"
-        f"$t=New-ScheduledTaskTrigger -Daily -At '{time_str}';"
-        # StartWhenAvailable = run ASAP if the scheduled time was missed
-        # (machine off/hibernated). WakeToRun = wake from sleep to run.
+        + trigger +
         "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun "
         "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-ExecutionTimeLimit (New-TimeSpan -Hours 1);"
-        "$p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive "
-        "-RunLevel Highest;"
+        + principal +
         f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t "
         "-Settings $s -Principal $p -Force | Out-Null;"
         "Write-Output 'ok'"
@@ -424,8 +441,9 @@ def install_task(time_str):
             "task registration failed:\n"
             + (proc.stdout or "") + (proc.stderr or "")
         )
-    print(f"Installed '{TASK_NAME}' -> daily at {time_str}. If the PC is off or "
-          f"asleep then, it runs at the next wake/login. Logs to {CSV_FILE}")
+    who = "logged-on user (all-users)" if all_users else "current user"
+    print(f"Installed '{TASK_NAME}' -> daily at {time_str}, runs as {who}. "
+          f"Catches up at next wake/login if the PC was off. Logs to {CSV_FILE}")
 
 
 def uninstall_task():
@@ -437,6 +455,11 @@ def uninstall_task():
 
 
 def main():
+    if "--install-task-allusers" in sys.argv:
+        i = sys.argv.index("--install-task-allusers")
+        time_str = sys.argv[i + 1] if i + 1 < len(sys.argv) else "18:00"
+        install_task(time_str, all_users=True)
+        return
     if "--install-task" in sys.argv:
         i = sys.argv.index("--install-task")
         time_str = sys.argv[i + 1] if i + 1 < len(sys.argv) else "18:00"
@@ -471,14 +494,19 @@ def main():
         })
 
     if "--log" in sys.argv:
-        new = not os.path.exists(CSV_FILE)
-        with open(CSV_FILE, "a", newline="") as fh:
-            w = csv.writer(fh)
-            if new:
-                w.writerow(["date", "time", "email", "session_pct", "weekly_pct"])
-            w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M"),
-                        email or "", five, seven])
-        print(f"logged -> {CSV_FILE}")
+        try:
+            new = not os.path.exists(CSV_FILE)
+            with open(CSV_FILE, "a", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(["date", "time", "email",
+                                "session_pct", "weekly_pct"])
+                w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M"),
+                            email or "", five, seven])
+            print(f"logged -> {CSV_FILE}")
+        except OSError as e:
+            # Non-fatal: Supabase already has the row; CSV is a local convenience.
+            print(f"csv log skipped ({e})")
 
 
 if __name__ == "__main__":
