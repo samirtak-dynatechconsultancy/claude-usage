@@ -23,14 +23,20 @@ data-handling policy before deploying.
 
 ---
 
-## 2. Hard requirements ⚠️
+## 2. Hard requirements
 
 | Requirement | Why |
 |-------------|-----|
 | Windows 10 (1607+) / 11, x64 | ScheduledTasks + VSS |
-| **Users are LOCAL ADMINS** | VSS needs elevation; a "Run with highest privileges" task only elevates if the user can. **If your users are standard (non-admin), this method will NOT work** — see §7. |
 | Claude **Desktop** installed & user signed in | The cookie source. Not Claude Code / web. |
 | Outbound HTTPS to `claude.ai` and `*.supabase.co` | Read usage + push data. |
+
+**Standard (non-admin) users are supported.** The Intune install registers a
+**SYSTEM-context** scheduled task. The SYSTEM task holds the elevation needed for
+the Volume Shadow Copy, and it briefly impersonates the logged-on user only to
+unwrap that user's DPAPI-protected cookie key. So end users need **no admin
+rights**. (One caveat: it reads the **active console session** user — designed
+for 1:1 laptops/desktops, not multi-session RDS hosts.)
 
 ---
 
@@ -81,9 +87,9 @@ Produces `Install.intunewin`.
 
 ## 5. Assignment
 
-Assign as **Required** to a **device** or **user** group (pilot group first).
-Because the task runs as the logged-on user, target users/devices where people
-actually sign in interactively.
+Assign as **Required** to a **device** group (pilot group first). The task runs
+as SYSTEM but reads whoever is signed in at the console, so target
+devices/people who actually sign in interactively.
 
 ## 6. Verify on a test device
 
@@ -93,14 +99,19 @@ Start-ScheduledTask   -TaskName ClaudeUsageDaily   # force a run; then re-check 
 ```
 A new row should appear in the Supabase `claude_usage` table.
 
-## 7. If users are NOT local admins
+## 7. How it works for non-admin users (technical)
 
-VSS (and therefore this Desktop-cookie method) won't work. Options:
-- Deploy the **browser userscript** (`usage_tracker.user.js`) as a managed
-  **Edge/Chrome extension** via Intune — only works if staff use **claude.ai in
-  the browser**, not the Desktop app.
-- Or grant the collector's task a managed admin context another way (out of
-  scope here; discuss with IT).
+The scheduled task runs as **NT AUTHORITY\SYSTEM** (`--system-collect`):
+1. SYSTEM finds the active console user's token (`WTSQueryUserToken`) and profile.
+2. SYSTEM copies that user's locked Claude cookie DB via **Volume Shadow Copy**
+   (`esentutl /y /vss`) - the step that needs elevation.
+3. SYSTEM **impersonates the user's token** for a single `CryptUnprotectData`
+   call to unwrap the DPAPI-protected cookie key, then reverts.
+4. Back as SYSTEM: decrypt the cookie, call the usage endpoint, push to Supabase.
+
+No end-user rights are required. If you'd rather not run as SYSTEM at all, the
+alternative is deploying the browser userscript (`usage_tracker.user.js`) as a
+managed Edge/Chrome extension - but only if staff use claude.ai in the browser.
 
 ## 8. Notes
 - The task fires daily at **18:00** and **at logon**, catches up if the PC was

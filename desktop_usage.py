@@ -382,49 +382,76 @@ def resolve_and_fetch(cookie):
 TASK_NAME = "ClaudeUsageDaily"
 
 
-def _task_action_parts():
-    """(execute, argument) for the scheduled-task action."""
+def _task_cmd(mode):
+    """(execute, argument) for the scheduled-task action running `mode`
+    (e.g. '--log')."""
     if getattr(sys, "frozen", False):
-        return sys.executable, "--log"
+        return sys.executable, mode
     py = sys.executable
     pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
     exe = pyw if os.path.exists(pyw) else py
-    return exe, f'"{os.path.abspath(__file__)}" --log'
+    return exe, f'"{os.path.abspath(__file__)}" {mode}'
 
 
-def install_task(time_str, all_users=False):
-    """Create a daily, elevated scheduled task that logs usage via VSS.
+def _trigger_ps(value, unit, at_time):
+    """Build the PowerShell '$t=...;' trigger for 'every <value> <unit>'.
+    minutes/hours -> repeat from now indefinitely; days/weeks -> at a set time.
+    Returns (trigger_ps, is_sub_day)."""
+    value = int(value)
+    if value < 1:
+        raise SystemExit("interval number must be 1 or more")
+    u = unit.lower().rstrip("s")
+    if u in ("minute", "min", "m"):
+        span = f"New-TimeSpan -Minutes {value}"
+    elif u in ("hour", "hr", "h"):
+        span = f"New-TimeSpan -Hours {value}"
+    elif u in ("day", "d"):
+        return (f"$t=New-ScheduledTaskTrigger -Daily -DaysInterval {value} "
+                f"-At '{at_time}';", False)
+    elif u in ("week", "wk", "w"):
+        # every N weeks == every N*7 days at the given time (from install date)
+        return (f"$t=New-ScheduledTaskTrigger -Daily -DaysInterval {value * 7} "
+                f"-At '{at_time}';", False)
+    else:
+        raise SystemExit(f"unknown unit '{unit}' (use minutes|hours|days|weeks)")
+    # minutes/hours: a one-time start that repeats forever.
+    return (f"$t=New-ScheduledTaskTrigger -Once -At (Get-Date) "
+            f"-RepetitionInterval ({span}) "
+            f"-RepetitionDuration (New-TimeSpan -Days 9999);", True)
 
-    all_users=False -> task runs as the current user (interactive per-user install).
-    all_users=True  -> task runs as whichever member of BUILTIN\\Users is logged
-                       on (for Intune/SYSTEM-context deploys), and also fires at
-                       logon. Requires that logged-on user to be a local admin,
-                       since VSS needs elevation.
 
-    Uses PowerShell's ScheduledTasks module for StartWhenAvailable (catch up a
-    missed run after the PC was off) + WakeToRun, which schtasks.exe can't set.
+def install_task(value, unit, at_time="18:00", all_users=False):
+    """Create an elevated repeating scheduled task that logs usage via VSS.
+
+    Runs 'every <value> <unit>' (unit in minutes|hours|days|weeks), repeating
+    indefinitely. For days/weeks it fires at `at_time`; for minutes/hours it
+    starts now and repeats on the interval.
+
+    all_users=True registers it for BUILTIN\\Users (multi-user machine); default
+    is the current user. Uses StartWhenAvailable (+ WakeToRun for day/week
+    cadences) so a missed run catches up.
     """
     if not _is_admin():
-        raise SystemExit("Run install elevated (admin) or in SYSTEM context.")
-    execute, argument = _task_action_parts()
+        raise SystemExit("Run install elevated (admin).")
+    execute, argument = _task_cmd("--log")
+    trigger, sub_day = _trigger_ps(value, unit, at_time)
 
     if all_users:
         principal = ("$p=New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' "
                      "-RunLevel Highest;")
-        trigger = (f"$t=@((New-ScheduledTaskTrigger -Daily -At '{time_str}'),"
-                   "(New-ScheduledTaskTrigger -AtLogOn));")
     else:
         principal = (
             "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
             "$p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive "
             "-RunLevel Highest;")
-        trigger = f"$t=New-ScheduledTaskTrigger -Daily -At '{time_str}';"
 
+    # Don't wake the PC for minute/hour cadences (that would defeat sleep).
+    wake = "" if sub_day else "-WakeToRun "
     ps = (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute '{execute}' -Argument '{argument}';"
         + trigger +
-        "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun "
+        "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable " + wake +
         "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-ExecutionTimeLimit (New-TimeSpan -Hours 1);"
         + principal +
@@ -441,9 +468,10 @@ def install_task(time_str, all_users=False):
             "task registration failed:\n"
             + (proc.stdout or "") + (proc.stderr or "")
         )
-    who = "logged-on user (all-users)" if all_users else "current user"
-    print(f"Installed '{TASK_NAME}' -> daily at {time_str}, runs as {who}. "
-          f"Catches up at next wake/login if the PC was off. Logs to {CSV_FILE}")
+    when = (f"every {value} {unit}" if sub_day
+            else f"every {value} {unit} at {at_time}")
+    print(f"Installed '{TASK_NAME}' -> {when}. Catches up if the PC was off. "
+          f"Logs to {CSV_FILE}")
 
 
 def uninstall_task():
@@ -455,15 +483,26 @@ def uninstall_task():
 
 
 def main():
-    if "--install-task-allusers" in sys.argv:
-        i = sys.argv.index("--install-task-allusers")
-        time_str = sys.argv[i + 1] if i + 1 < len(sys.argv) else "18:00"
-        install_task(time_str, all_users=True)
-        return
-    if "--install-task" in sys.argv:
-        i = sys.argv.index("--install-task")
-        time_str = sys.argv[i + 1] if i + 1 < len(sys.argv) else "18:00"
-        install_task(time_str)
+    def _opt(flag, default=None):
+        if flag in sys.argv:
+            j = sys.argv.index(flag)
+            if j + 1 < len(sys.argv):
+                return sys.argv[j + 1]
+        return default
+
+    if "--install-task" in sys.argv or "--install-task-allusers" in sys.argv:
+        all_users = "--install-task-allusers" in sys.argv
+        flag = "--install-task-allusers" if all_users else "--install-task"
+        every = _opt("--every")
+        unit = _opt("--unit")
+        at_time = _opt("--at", "18:00")
+        # Back-compat: `--install-task HH:MM` == every 1 day at HH:MM.
+        i = sys.argv.index(flag)
+        nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        if every is None and re.match(r"^\d{1,2}:\d{2}$", nxt):
+            at_time, every, unit = nxt, "1", "days"
+        install_task(int(every or "1"), unit or "days", at_time,
+                     all_users=all_users)
         return
     if "--uninstall-task" in sys.argv:
         uninstall_task()

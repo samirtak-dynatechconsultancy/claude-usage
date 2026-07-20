@@ -11,5 +11,6 @@ build/
 dist/
 *.spec
 release/
+ClaudeUsage-Setup/
 *.zip
 build_log.txt
